@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -76,6 +76,26 @@ class EpisodeResult:
     tool_calls: int
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     prediction: Prediction | None = None
+
+
+@dataclass(frozen=True)
+class ExtraTool:
+    """A tool the caller adds to an episode, beside the mode's own.
+
+    ``definition`` is the tool as the model sees it, in the OpenAI function
+    format of the mode's tools; ``run`` takes the call's arguments and returns
+    the observation. An extra tool never answers, so the episode still ends
+    with the mode's answer, and the last turn, which is for the answer alone,
+    does not offer it. A benchmark whose user can be asked, for example, adds
+    the tool that asks them.
+    """
+
+    definition: dict[str, Any]
+    run: Callable[..., str]
+
+    @property
+    def name(self) -> str:
+        return str(self.definition["function"]["name"])
 
 
 def submit(
@@ -153,7 +173,11 @@ def _retrieve(
 
 
 def _dispatch(
-    ctx: ToolContext, name: str, args: dict, offered: list[str]
+    ctx: ToolContext,
+    name: str,
+    args: dict,
+    offered: list[str],
+    extra: dict[str, Callable[..., str]] | None = None,
 ) -> tuple[str, Submission | Prediction | None]:
     handlers: dict[str, Callable[..., str]] = {
         ToolName.RETRIEVE: lambda query="", kinds=None, purpose="sql": _retrieve(
@@ -167,6 +191,8 @@ def _dispatch(
     try:
         if name not in offered:
             return f"Unknown tool {name!r}. Use {', '.join(offered)}.", None
+        if extra and name in extra:
+            return extra[name](**args), None
         if name == ToolName.SUBMIT:
             return submit(ctx, **args)
         if name == ToolName.RUN_SQL and prompts.is_answer(name, args):
@@ -194,12 +220,15 @@ def run_episode(
     dialect: str | None = None,
     mode: EpisodeMode = EpisodeMode.SQL,
     custom_prompts: str | None = None,
+    extra_tools: Sequence[ExtraTool] = (),
 ) -> EpisodeResult:
     """Run the model with *mode*'s tools until it answers or the budget ends.
 
     ``sql`` answers with ``submit``, ``predict`` with ``predict``, and ``auto``
     offers both and lets the model choose. *custom_prompts* is the
     organization's sections from :func:`prompts.custom_prompts_section`.
+    *extra_tools* are offered beside the mode's tools, except on the last turn;
+    each call of one counts against the budget like any other.
     """
     system_prompt = prompts.system_prompt_for(
         mode, dialect, information_answers=ctx.information_answers
@@ -221,6 +250,10 @@ def run_episode(
         {"role": m.type, "content": m.content} for m in messages
     ]
     tools = prompts.tools_for(mode, information_answers=ctx.information_answers)
+    extra = {tool.name: tool.run for tool in extra_tools}
+    if clashes := sorted(extra.keys() & {t["function"]["name"] for t in tools}):
+        raise ValueError(f"Extra tools {clashes} have the names of the episode's own")
+    tools = [*tools, *(tool.definition for tool in extra_tools)]
     offered = [t["function"]["name"] for t in tools]
     bound = llm.bind_tools(tools)
     budget = config.max_tool_calls()
@@ -296,7 +329,7 @@ def run_episode(
                     answered_over_budget = True
                 made.add(key)
                 calls += 1
-                observation, answer = _dispatch(ctx, name, args, offered)
+                observation, answer = _dispatch(ctx, name, args, offered, extra)
             messages.append(
                 ToolMessage(content=observation, tool_call_id=call.get("id") or name)
             )
